@@ -2,17 +2,19 @@
 # ==============================================================================
 # Script Name: storms.sh
 # Description: Scheduler for the storm-*.sh event scripts. Runs every 5 minutes
-#              from cron, all day. Each ISO week it randomly picks 3 days to
-#              run a storm on, and starts the queued storm when that day's
-#              window opens -- then, critically, ends it when the recorded
-#              end time passes.
+#              from cron, all day. A storm starts every STORM_INTERVAL_DAYS
+#              days (2 = every other day), rotating through all storm-*.sh
+#              scripts in random order with the vacation day always closing
+#              out each rotation cycle, then reshuffling for the next one --
+#              then, critically, ends it when the recorded end time passes.
 #
 #              The end lives in a file (.active_storm), not a systemd timer.
 #              Transient timers are held in RAM and die with the container; on
 #              Sept 8 a reboot at 12:00 destroyed one and Miracle Day ran until
 #              it was stopped by hand. A file plus a tick survives reboots.
 #
-#              The window depends on which day of the week gets picked:
+#              Whichever day the interval happens to land on, that day's
+#              window still applies:
 #                Saturday   10:00-16:00
 #                Sunday     12:00-18:00
 #                Mon-Fri    16:00-22:00
@@ -20,21 +22,20 @@
 #
 # Options:
 #   --dry       Show what would happen. Changes nothing.
-#   --status    Print current state (active storm, this week's days, queue)
-#               and exit.
+#   --status    Print current state (active storm, cadence, queue) and exit.
 #   --end       End the running storm now.
 #   --force <storm-x.sh>   Start a specific storm immediately, ignoring the
-#                          day/window gate. Does not consume a queue slot and
-#                          does not count as today's storm.
-#   --allow-tonight        Add today to this week's storm days if it isn't
-#                          one already, so the regular window tick can fire
-#                          today. Does NOT start anything itself and does not
-#                          touch the time-of-day gate -- the queued storm
-#                          still only starts once the clock actually reaches
-#                          today's window-open hour. A no-op if today was
-#                          already a storm day.
+#                          interval/window gate. Does not consume a queue
+#                          slot and does not count as this cycle's start for
+#                          interval purposes.
+#   --allow-tonight        Waive the interval gate for today, so the regular
+#                          window tick can fire even if it's too soon since
+#                          the last storm. Does NOT start anything itself and
+#                          does not touch the time-of-day gate -- the queued
+#                          storm still only starts once the clock reaches
+#                          today's window-open hour. A no-op if today is
+#                          already interval-eligible.
 #   --resetqueue           Reshuffle which storm runs next.
-#   --resetdays             Re-roll this week's 3 storm days.
 # ==============================================================================
 
 set -euo pipefail
@@ -49,7 +50,7 @@ export TZ=America/Toronto
 
 STORMS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-STORMS_PER_WEEK=3        # how many days each ISO week get a storm
+STORM_INTERVAL_DAYS=2    # minimum days between storm starts (2 = every other day)
 START_GRACE_MIN=25       # how late a missed window-open tick may still start
 LEAD_MIN=5                # fire --end this early, so the lib's 5m player
                           # warning lands the restart on the hour
@@ -58,7 +59,6 @@ VACATION_STORM="storm-vacationday.sh"
 QUEUE_FILE="${QUEUE_FILE:-$STORMS_DIR/.storm_queue}"
 ACTIVE_FILE="${ACTIVE_FILE:-$STORMS_DIR/.active_storm}"
 LAST_END_FILE="${LAST_END_FILE:-$STORMS_DIR/.last_storm_end}"
-WEEK_DAYS_FILE="${WEEK_DAYS_FILE:-$STORMS_DIR/.storm_days}"
 LAST_START_DATE_FILE="${LAST_START_DATE_FILE:-$STORMS_DIR/.last_storm_start_date}"
 LOCK_FILE="${LOCK_FILE:-/var/lock/pz-storm-tick.lock}"
 
@@ -71,7 +71,6 @@ while [ $# -gt 0 ]; do
     --status)     ACTION="status" ;;
     --end)        ACTION="end" ;;
     --resetqueue) ACTION="resetqueue" ;;
-    --resetdays)  ACTION="resetdays" ;;
     --force)      ACTION="force"; FORCE_STORM="${2:-}"; shift
                   [ -n "$FORCE_STORM" ] || { echo "--force needs a storm script name" >&2; exit 64; } ;;
     --allow-tonight) ACTION="allow_tonight" ;;
@@ -88,8 +87,6 @@ flock -n 9 || exit 0
 NOW="$(date +%s)"
 TODAY="$(date +%F)"        # YYYY-MM-DD, dedupes "already started today"
 TODAY_ABBR="$(date +%a)"   # Mon, Tue, ... Sun
-WEEK_ID="$(date +%G-W%V)"  # ISO year-week (Monday start) -- the pick resets
-                           # each time this rolls over
 
 read_active() {
   ACTIVE_SCRIPT=""; ACTIVE_END=0
@@ -122,42 +119,21 @@ build_queue() {
   log "New rotation cycle: $(cat "$QUEUE_FILE")"
 }
 
-# This ISO week's 3 storm days, chosen fresh each week. File format:
-# "<week-id> Day Day Day".
-build_week_days() {
-  local days=(Mon Tue Wed Thu Fri Sat Sun) picked
-  picked="$(printf '%s\n' "${days[@]}" | shuf -n "$STORMS_PER_WEEK" | tr '\n' ' ')"
-  picked="${picked% }"
-  printf '%s %s\n' "$WEEK_ID" "$picked" > "$WEEK_DAYS_FILE"
-  log "New week ($WEEK_ID): storm days = $picked"
+# Days since the last recorded storm start, or unbounded (no gate) if none is
+# on record yet. Comparing calendar dates (not "now minus start epoch") means
+# a storm that started at 21:00 still counts today as day zero, matching how
+# an operator would count "every other day" by eye.
+days_since_last_start() {
+  local last_date last_epoch today_epoch
+  [ -f "$LAST_START_DATE_FILE" ] || { echo 999999; return 0; }
+  last_date="$(cat "$LAST_START_DATE_FILE")"
+  last_epoch="$(date -d "$last_date" +%s)" || { echo 999999; return 0; }
+  today_epoch="$(date -d "$TODAY" +%s)"
+  echo $(( (today_epoch - last_epoch) / 86400 ))
 }
 
-# Space-separated day list for the current week, rebuilding it if the stored
-# pick is missing or belongs to a previous week. Once a week's days are
-# picked they don't change again that week -- a later tick just reads them.
-current_week_days() {
-  if [ ! -f "$WEEK_DAYS_FILE" ]; then
-    build_week_days
-  else
-    local stored_week
-    read -r stored_week _ < "$WEEK_DAYS_FILE"
-    [ "$stored_week" = "$WEEK_ID" ] || build_week_days
-  fi
-  local _wk rest
-  read -r _wk rest < "$WEEK_DAYS_FILE"
-  echo "$rest"
-}
-
-today_is_storm_day() {
-  local d
-  for d in $(current_week_days); do
-    [ "$d" = "$TODAY_ABBR" ] && return 0
-  done
-  return 1
-}
-
-already_started_today() {
-  [ -f "$LAST_START_DATE_FILE" ] && [ "$(cat "$LAST_START_DATE_FILE")" = "$TODAY" ]
+interval_satisfied() {
+  [ "$(days_since_last_start)" -ge "$STORM_INTERVAL_DAYS" ]
 }
 
 start_storm() {
@@ -205,15 +181,17 @@ case "$ACTION" in
       le="$(last_end)"
       [ "$le" -gt 0 ] && echo "LAST   : ended $(date -d "@$le" '+%F %H:%M')"
     fi
-    if [ -f "$WEEK_DAYS_FILE" ]; then
-      read -r stored_week rest < "$WEEK_DAYS_FILE"
-      if [ "$stored_week" = "$WEEK_ID" ]; then
-        echo "DAYS   : this week ($WEEK_ID) = $rest"
+    if [ -f "$LAST_START_DATE_FILE" ]; then
+      last_date="$(cat "$LAST_START_DATE_FILE")"
+      since="$(days_since_last_start)"
+      echo "CADENCE: every $STORM_INTERVAL_DAYS day(s) -- last started $last_date ($since day(s) ago)"
+      if interval_satisfied; then
+        echo "         eligible today, waiting for the window to open"
       else
-        echo "DAYS   : last picked for $stored_week ($rest) — stale, re-rolls on the next tick"
+        echo "         next eligible $(date -d "$last_date +$STORM_INTERVAL_DAYS days" '+%F')"
       fi
     else
-      echo "DAYS   : not yet picked — rolls on the next tick"
+      echo "CADENCE: every $STORM_INTERVAL_DAYS day(s) -- no prior start on record, eligible today"
     fi
     echo "QUEUE  : $( [ -f "$QUEUE_FILE" ] && cat "$QUEUE_FILE" || echo '(will be built on first start)' )"
     exit 0 ;;
@@ -225,21 +203,18 @@ case "$ACTION" in
   resetqueue)
     build_queue; exit 0 ;;
 
-  resetdays)
-    build_week_days; exit 0 ;;
-
   force)
     [ -z "$ACTIVE_SCRIPT" ] || { log "ERROR: $ACTIVE_SCRIPT is already running. End it first."; exit 1; }
     start_storm "$FORCE_STORM"; exit $? ;;
 
   allow_tonight)
-    [ -z "$ACTIVE_SCRIPT" ] || { log "ERROR: $ACTIVE_SCRIPT is already running -- can't add today while something's active."; exit 1; }
-    if today_is_storm_day; then
-      log "Today ($TODAY_ABBR) is already a storm day -- nothing to waive."
+    [ -z "$ACTIVE_SCRIPT" ] || { log "ERROR: $ACTIVE_SCRIPT is already running -- can't waive the interval while something's active."; exit 1; }
+    if interval_satisfied; then
+      log "Already interval-eligible today -- nothing to waive."
       exit 0
     fi
-    printf '%s %s %s\n' "$WEEK_ID" "$(current_week_days)" "$TODAY_ABBR" > "$WEEK_DAYS_FILE"
-    log "Added $TODAY_ABBR to this week's storm days -- today's regular window tick can now start the queued storm."
+    rm -f "$LAST_START_DATE_FILE"
+    log "Cleared the last-start record so today's window tick can fire despite the ${STORM_INTERVAL_DAYS}-day interval."
     exit 0 ;;
 esac
 
@@ -253,15 +228,10 @@ if [ -n "$ACTIVE_SCRIPT" ]; then
   exit 0
 fi
 
-# Idle. Only start on one of this week's picked days.
-if ! today_is_storm_day; then
-  exit 0
-fi
-
-# And only once per calendar day -- guards against re-triggering the same
-# day's slot if a storm was ended early by hand and the tick lands again
-# within the same window.
-if already_started_today; then
+# Idle. Only start once the interval since the last storm has elapsed --
+# this alone also covers "already started today" (day zero never satisfies a
+# >=1 day interval), so there's no separate same-day dedupe check needed.
+if ! interval_satisfied; then
   exit 0
 fi
 
