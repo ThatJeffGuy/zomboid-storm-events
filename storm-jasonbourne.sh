@@ -4,7 +4,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/pz-storm-lib.sh"
 STORM_NAME="Jesus Christ.. That's Jason Bourne.."
 : "${STORM_HOURS:=}"
 : "${STORM_END_TIME:=22}"
-STORM_BLURB="<RGB:0.7,0.7,0.9>Jesus Christ.. That's Jason Bourne..<LINE><RGB:0.4,1,0.4>Like all the agents Jason took out, Zombies are dumb but they have ears everywhere! Hearing is set to maximum! Crouching makes you invisible. Gunpowder and firearms loot are doubled, with Aiming, Reloading, and Nimble XP all boosted.<LINE>"
+STORM_BLURB="<RGB:0.7,0.7,0.9>Yeah yeah.. we all know the meme..<LINE><RGB:0.4,1,0.4>Like all the agents Jason took out, Zombies are dumb but they have ears everywhere! Hearing is set to maximum! Crouching makes you invisible. Gunpowder and firearms loot are doubled, with Aiming, Reloading, and Nimble XP all boosted.<LINE>"
 
 OVERRIDES="
   MultiplierConfig.GlobalToggle = false
