@@ -13,6 +13,9 @@ changes, and the like -- then automatically revert everything afterward.
 - Rewrites the server MOTD to announce the event, and exposes flags a
   companion website can read to show what's active/next to players (see
   [zomboid-status-page](https://github.com/ThatJeffGuy/zomboid-status-page)).
+- Optionally adds the running event to the server-browser description
+  (`PublicDescription`): "NOW ON: <event>", the blurb's first sentence and
+  when it ends, trimmed to the game's 256-character limit.
 
 > **Note:** this is the current version of what used to ship inside
 > [zomboid-scripts](https://github.com/ThatJeffGuy/zomboid-scripts) as
@@ -49,7 +52,8 @@ storms.sh --resetdays       # re-roll this week's storm days
 
 1. Edit `pz-storm-lib.sh`'s config block: `CONFIG_DIR`/`SERVER_CONFIG_NAME`
    (must match your actual `.ini`/`_SandboxVars.lua` filenames), `CONTAINER`,
-   RCON connection, and `BASE_MOTD`.
+   RCON connection, `BASE_MOTD`, and optionally `BASE_DESC` (your normal
+   server-browser description; leave it empty to never touch it).
 2. Create a `baseline_SandboxVars.lua` in `CONFIG_DIR` -- a copy of your
    server's normal (non-event) sandbox settings. This is what every storm
    patches from and every "end" reverts back to.

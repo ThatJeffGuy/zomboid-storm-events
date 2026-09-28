@@ -27,6 +27,9 @@ WARN_MINUTES=5                           # 0 to restart immediately
 
 # Permanent top of the MOTD. The storm block is appended below it.
 BASE_MOTD="Welcome to the server. Questions or problems, come find an admin. Have fun!"
+# Server-browser description (PublicDescription) between events; during one, the event is added below it.
+# Leave empty to never touch PublicDescription. Rich text works: " <LINE> " breaks a line.
+BASE_DESC=""
 
 INI_FILE="${CONFIG_DIR}/${SERVER_CONFIG_NAME}.ini"
 SANDBOX_FILE="${CONFIG_DIR}/${SERVER_CONFIG_NAME}_SandboxVars.lua"
@@ -191,6 +194,9 @@ run_storm() {
   done
 
   local overrides motd ini_over
+  # The server-browser description (PublicDescription, 256 chars max) carries the event too; its
+  # parts are assembled in the python pass, which trims the blurb to fit.
+  local desc_event="" desc_blurb="" desc_until=""
   if [ "$mode" = "end" ]; then
     overrides=""
     ini_over="${INI_END:-}"
@@ -202,6 +208,7 @@ run_storm() {
     ENDS_AT="$(end_epoch)"
     until_str="$(date -d "@${ENDS_AT}" '+%A %-I:%M %p')"
     motd="${BASE_MOTD} <LINE> <LINE> <RGB:1,0.6,0>NOW ON: ${STORM_NAME} <LINE> ${STORM_BLURB} <LINE> <RGB:0.7,0.7,0.7>Back to normal ${until_str}."
+    desc_event="$STORM_NAME"; desc_blurb="$STORM_BLURB"; desc_until="$until_str"
   fi
 
   for f in "$INI_FILE" "$SANDBOX_FILE" "$BASELINE_FILE"; do
@@ -217,7 +224,8 @@ run_storm() {
   # distinct, and skips comment lines whose scale legends ("-- 1 = Insane") look
   # exactly like assignments. Aborts on a key it can't find, so a typo fails
   # loudly instead of silently doing nothing.
-  OVERRIDES="$overrides" MOTD="$motd" INI_OVERRIDES="$ini_over" python3 - \
+  OVERRIDES="$overrides" MOTD="$motd" INI_OVERRIDES="$ini_over" \
+  BASE_DESC="$BASE_DESC" DESC_EVENT="$desc_event" DESC_BLURB="$desc_blurb" DESC_UNTIL="$desc_until" python3 - \
     "$BASELINE_FILE" "$staged_lua" "$INI_FILE" "$staged_ini" <<'PY'
 import os, re, sys
 base, out_lua, ini, out_ini = sys.argv[1:5]
@@ -269,10 +277,37 @@ for line in os.environ.get("INI_OVERRIDES", "").splitlines():
     ini_want[k.strip()] = v.strip()
 
 motd, found, ini_hit = os.environ["MOTD"], False, set()
+
+# Server-browser description: base line, plus the running event. The browser's details panel is
+# rich text (" <LINE> " breaks, <RGB:r,g,b> colours) and the game caps it at 256 characters, so the
+# blurb is cut to its first sentence and, if still too long, trimmed with "...".
+DESC_MAX = 256
+desc = os.environ.get("BASE_DESC", "")
+event = os.environ.get("DESC_EVENT", "")
+if desc and event:
+    head = f"{desc} <LINE> <RGB:1,0.6,0>NOW ON: {event} <LINE> <RGB:0.85,0.85,0.85>"
+    tail = f" <LINE> <RGB:0.6,0.6,0.6>Back to normal {os.environ.get('DESC_UNTIL', '')}."
+    # the blurbs carry their own rich-text tags; drop them so a trim can't cut one in half
+    blurb = os.environ.get("DESC_BLURB", "")
+    blurb = re.sub(r'\s*<LINE>\s*', ' ', blurb)
+    blurb = re.sub(r'<[A-Z]+(:[^>]*)?>', '', blurb)
+    blurb = re.sub(r'\s+', ' ', blurb).strip()
+    first = re.split(r'(?<=[.!?])\s+', blurb, maxsplit=1)[0] if blurb else ""
+    room = DESC_MAX - len(head) - len(tail)
+    if len(first) > room:
+        first = first[:max(0, room - 3)].rstrip() + "..." if room > 3 else ""
+    desc = head + first + tail
+    if len(desc) > DESC_MAX:                   # very long event name: drop the blurb line entirely
+        desc = (head.rsplit(" <LINE> ", 1)[0] + tail)[:DESC_MAX]
+desc_found = not desc                          # no BASE_DESC configured: leave the ini line alone
+
 with open(ini, encoding='utf-8') as fh, open(out_ini, 'w', encoding='utf-8') as w:
     for line in fh:
         if line.startswith('ServerWelcomeMessage='):
             w.write(f"ServerWelcomeMessage={motd}\n"); found = True
+            continue
+        if desc and line.startswith('PublicDescription='):
+            w.write(f"PublicDescription={desc}\n"); desc_found = True
             continue
         key = line.split('=', 1)[0] if '=' in line and not line.startswith('#') else None
         if key in ini_want:
@@ -281,13 +316,16 @@ with open(ini, encoding='utf-8') as fh, open(out_ini, 'w', encoding='utf-8') as 
             w.write(line)
     if not found:
         w.write(f"ServerWelcomeMessage={motd}\n")
+    if not desc_found:
+        w.write(f"PublicDescription={desc}\n")
 
 ini_missing = sorted(set(ini_want) - ini_hit)
 if ini_missing:
     sys.exit("ini keys not found: " + ", ".join(ini_missing))
 
 extra = f", {len(ini_hit)} ini key(s)" if ini_hit else ""
-print(f"{len(hit)} sandbox override(s) applied, MOTD rewritten{extra}")
+dnote = f", description {len(desc)} chars" if desc else ""
+print(f"{len(hit)} sandbox override(s) applied, MOTD rewritten{dnote}{extra}")
 PY
 
   if [ "$dry" = 1 ]; then
@@ -295,6 +333,8 @@ PY
     diff -u "$SANDBOX_FILE" "$staged_lua" || true
     log "DRY RUN — MOTD would be:"
     grep '^ServerWelcomeMessage=' "$staged_ini"
+    log "DRY RUN — browser description would be:"
+    grep '^PublicDescription=' "$staged_ini"
     return 0
   fi
 
